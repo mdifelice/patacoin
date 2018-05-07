@@ -1,0 +1,553 @@
+#!/usr/bin/php
+<?php
+declare( ticks = 1 );
+
+define( 'MAX_NODES', 8 );
+
+require_once __DIR__ . '/inc/class-blockchain.php';
+require_once __DIR__ . '/inc/class-http-json-client.php';
+require_once __DIR__ . '/inc/class-http-json-server.php';
+require_once __DIR__ . '/inc/cli.php';
+require_once __DIR__ . '/inc/security.php';
+
+function get_node_id() {
+	global $folder;
+
+	$node_file = $folder . '/node.json';
+
+	try {
+		if ( ! file_exists( $node_file ) ) {
+			throw new Exception( 'Missing node file' );
+		}
+
+		$contents = file_get_contents( $node_file );
+
+		if ( ! $contents ) {
+			throw new Exception( 'Empty node file' );
+		}
+
+		$node_id = json_decode( $contents );
+
+		if ( null == $node_id ) {
+			throw new Exception( 'Invalid node ID' );
+		}
+	} catch ( Exception $e ) {
+		debug( sprintf( 'Error getting node ID: %s.', $e->getMessage() ) );
+
+		$node_id = hash_text( uniqid() );
+
+		file_put_contents( $node_file, json_encode( $node_id ) );
+	}
+
+	return $node_id;
+}
+
+function create_client( $address ) {
+	global $node_id, $port;
+
+	$headers = array(
+		'Patacoin-Sender' => array(
+			'type' => 'node',
+			'id'   => $node_id,
+			'port' => $port,
+		),
+	);
+
+	return new HTTP_JSON_Client( $address, $headers );
+}
+
+function receive_block_count( $block_count, $client_node_id, $client ) {
+	global $blockchain;
+
+	debug( sprintf( 'Blockchain length %s', $block_count ) ); 
+
+	if ( $block_count > $blockchain->get_block_count() ) {
+		debug( 'Since blockchain is bigger, asking for it...' );
+
+		try {
+			$data = $client->get( '/get_blockchain' );
+
+			parse_blockchain( $data, $client_node_id );
+		} catch ( Exception $e ) {
+			remove_node( $client_node_id, $e->getMessage() );
+		}
+	}
+}
+
+function debug( $message ) {
+	global $debug;
+
+	if ( $debug ) {
+		print_message( $message );
+	}
+}
+
+function attach_signals( $signals, $callback ) {
+	foreach ( $signals as $signal ) {
+		pcntl_signal( $signal, $callback, false );
+	}
+}
+
+function signal_callback() {
+	global $server;
+
+	debug( 'Stopping server...' );
+
+	$server->stop();
+}
+
+function add_node( $id, $client ) {
+	global $nodes, $node_id;
+
+	if ( $node_id !== $id && ( ( ! isset( $nodes[ $id ] ) && count( $nodes ) < MAX_NODES ) || isset( $nodes[ $id ] ) ) )  {
+		$nodes[ $id ] = $client;
+	}
+}
+
+function remove_node( $id, $error ) {
+	global $nodes;
+
+	if ( $error ) {
+		debug( sprintf( "Removing node '%s': %s.", $id, $error ) );
+	}
+
+	if ( isset( $nodes[ $id ] ) ) {
+		unset( $nodes[ $id ] );
+	}
+}
+
+function send_message( $node_id, $message, $data = null, $callback = null ) {
+	global $nodes;
+
+	if ( isset( $nodes[ $node_id ] ) ) {
+		$client = $nodes[ $node_id ];
+
+		debug( sprintf( "Calling method '%s' on node '%s'...", $message, $node_id ) );
+
+		try {
+			if ( null === $data ) {
+				$method = 'GET';
+			} else {
+				$method = 'POST';
+			}
+
+			$response = $client->call( $method, sprintf( '/%s', $message ), $data );
+
+			if ( $callback ) {
+				$callback( $response, $node_id, $client );
+			}
+		} catch ( Exception $e ) {
+			remove_node( $node_id, $e->getMessage() );
+		}
+	}
+}
+
+function broadcast_message( $message, $data = null, $callback = null, $exclude_node = null ) {
+	global $nodes;
+
+	foreach ( $nodes as $id => $client ) {
+		if ( $id !== $exclude_node ) {
+			send_message( $id, $message, $data, $callback );
+		}
+	}
+}
+
+function parse_blockchain( $data, $exclude_node = null ) {
+	global $blockchain;
+
+	debug( 'Analyzing new blockchain...' );
+
+	$new_blockchain = new Blockchain();
+	$replaced       = false;
+
+	try {
+		$new_blockchain->fromObject( $data );
+
+		if ( $blockchain->get_block_count() >= $new_blockchain->get_block_count() ) {
+			throw new Exception( 'Blockchain equal or smaller' );
+		}
+
+		set_blockchain( $new_blockchain, $exclude_node );
+	} catch ( Exception $e ) {
+		debug( sprintf( 'Blockchain discarded: %s.', $e->getMessage() ) );
+	}
+
+	return $replaced;
+}
+
+function set_blockchain( $new_blockchain ) {
+	global $blockchain, $unconfirmed_transactions;
+
+	debug( 'Replacing current blockchain...' );
+
+	$blockchain = $new_blockchain;
+
+	foreach ( $unconfirmed_transactions as $hash => $unconfirmed_transaction ) {
+		if ( $blockchain->exists_transaction( $hash ) ) {
+			remove_unconfirmed_transaction( $hash );
+		}
+	}
+
+	save_blockchain();
+}
+
+function add_unconfirmed_transaction( $unconfirmed_transaction, $exclude_node ) {
+	global $blockchain, $unconfirmed_transactions;
+
+	if ( isset( $unconfirmed_transactions[ $unconfirmed_transaction->hash ] ) ) {
+		throw new Exception( 'Transaction already exists' );
+	} else {
+		$blockchain->validate_transaction( $unconfirmed_transaction );
+	}
+
+	$unconfirmed_transactions[ $unconfirmed_transaction->hash ] = $unconfirmed_transaction;
+
+	save_unconfirmed_transactions();
+
+	broadcast_message( 'create_transaction', $unconfirmed_transaction, null, $exclude_node );
+}
+
+function remove_unconfirmed_transaction( $unconfirmed_transaction_hash ) {
+	global $unconfirmed_transactions;
+
+	if ( isset( $unconfirmed_transactions[ $unconfirmed_transaction_hash ] ) ) {
+		unset( $unconfirmed_transactions[ $unconfirmed_transaction_hash ] );
+
+		save_unconfirmed_transactions();
+	}
+}
+
+function receive_message( $method, $path, $data, $headers, $host ) {
+	global $server, $blockchain, $nodes, $node_id, $unconfirmed_transactions;
+
+	$response = null;
+
+	$message = preg_replace( '/^\//', '', $path );
+
+	if ( isset( $headers['patacoin-sender'] ) ) {
+		$sender = @json_decode( trim( $headers['patacoin-sender'] ) );
+	} else {
+		$sender = null;
+	}
+
+	$sender_description = 'Unknown';
+	$exclude_node       = null;
+
+	if ( $sender && isset( $sender->type ) && isset( $sender->id ) ) {
+		switch ( $sender->type ) {
+			case 'node':
+				if ( isset( $sender->port ) ) {
+					$sender_description = sprintf( "Node@%s:%s '%s'", $host, $sender->port, $sender->id );
+				}
+
+				$exclude_node = $sender->id;
+				break;
+			case 'miner':
+				$sender_description = sprintf( "Miner@%s '%s'", $host, $sender->id );
+				break;
+			case 'wallet':
+				$sender_description = sprintf( "Wallet@%s '%s'", $host, $sender->id );
+				break;
+		}
+	}
+
+	debug( sprintf( "Received message '%s' from %s.", $message, $sender_description ) );
+
+	try {
+		switch ( $method ) {
+			case 'GET':
+				switch ( $message ) {
+					case 'get_nodes':
+						$response = $nodes;
+						break;
+					case 'ping':
+						if ( ! isset( $sender->port ) ) {
+							throw new Exception( "Missing header 'port'" );
+						}
+
+						if ( ! isset( $sender->id ) ) {
+							throw new Exception( "Missing header 'id'" );
+						}
+
+						$response = $node_id;
+						$address  = sprintf( '%s:%s', $host, $sender->port );
+						$client   = create_client( $address );
+
+						add_node( $sender->id, $client );
+						break;
+					case 'get_latest_block':
+						$response = $blockchain->get_latest_block();
+						break;
+					case 'get_block_count':
+						$response = $blockchain->get_block_count();
+						break;
+					case 'get_blockchain':
+						$response = $blockchain;
+						break;
+					case 'get_block':
+						if ( isset( $data->hash ) ) {
+							$response = $blockchain->get_block( $data->hash );
+						} else if ( isset( $data->index ) ) {
+							$response = $blockchain->get_block_by_index( $data->index );
+						} else {
+							throw new Exception( "Missing parameter 'hash' or 'index'" );
+						}
+						break;
+					case 'get_transaction':
+						if ( ! isset( $data->hash ) ) {
+							throw new Exception( "Missing parameter 'hash'" );
+						}
+
+						$response = $blockchain->get_transaction( $data->hash );
+						break;
+					case 'get_balance':
+						if ( ! isset( $data->address ) ) {
+							throw new Exception( "Missing parameter 'address'" );
+						}
+
+						$response = $blockchain->get_balance( $data->address );
+						break;
+					case 'get_unconfirmed_transactions':
+						$response = array_values( $unconfirmed_transactions );
+						break;
+					case 'get_difficulty':
+						$response = $blockchain->get_difficulty();
+						break;
+					case 'get_award_amount':
+						$response = $blockchain->get_award_amount();
+						break;
+				}
+				break;
+			case 'POST':
+				try {
+					$response = true;
+
+					switch ( $message ) {
+						case 'set_blockchain':
+							parse_blockchain( $data, $exclude_node );
+							break;
+						case 'create_transaction':
+							$transaction = new Transaction();
+
+							$transaction->fromObject( $data );
+
+							add_unconfirmed_transaction( $transaction, $exclude_node );
+							break;
+						case 'mine':
+							$block = new Block();
+
+							$block->fromObject( $data );
+
+							$new_blockchain = clone( $blockchain );
+
+							try {
+								$new_blockchain->add_block( $block );
+
+								set_blockchain( $new_blockchain );
+
+								broadcast_message( 'mine', $block, null, $exclude_node );
+							} catch ( Exception $e ) {
+								if ( $exclude_node ) {
+									debug( 'Received apparently valid block, tryin to update blockchain...' );
+
+									$server->on_after_callback( function() use( $exclude_node ) {
+										global $server;
+
+										$server->on_after_callback( null );
+
+										send_message( $exclude_node, 'get_block_count', null, 'receive_block_count' );
+									} );
+								} else {
+									$invalid_transactions = $new_blockchain->get_invalid_transactions();
+
+									foreach ( $invalid_transactions as $invalid_transaction ) {
+										remove_unconfirmed_transaction( $invalid_transaction );
+									}
+
+									debug( sprintf( 'Invalid mined block: %s.', $e->getMessage() ) );
+								}
+							}
+							break;
+					}
+				} catch ( Exception $e ) {
+					$response = false;
+
+					debug( sprintf( 'Error processing post request: %s.', $e->getMessage() ) );
+				}
+				break;
+		}
+
+		if ( null !== $response ) {
+			debug( sprintf( 'Response: %s.', is_scalar( $response ) ? $response : ( is_array( $response ) ? 'Array' : 'Object' ) ) );
+		} else {
+			debug( 'Unknown request.' );
+		}
+	} catch ( Exception $e ) {
+		debug( sprintf( 'Error receiving message: %s.', $e->getMessage() ) ); 
+	}
+
+	return $response;
+}
+
+function save_blockchain() {
+	global $blockchain_file, $blockchain;
+
+	if ( false === file_put_contents( $blockchain_file, json_encode( $blockchain ) ) ) {
+		debug( 'Cannot save blockchain.' );
+	}
+}
+
+function save_unconfirmed_transactions() {
+	global $unconfirmed_transactions_file, $unconfirmed_transactions;
+
+	if ( false === file_put_contents( $unconfirmed_transactions_file, json_encode( $unconfirmed_transactions ) ) ) {
+		debug( 'Cannot save unconfirmed transactions.' );
+	}
+}
+
+$arguments = parse_arguments( array(
+	'port' => array(
+		'default'  => '8765',
+		'required' => true,
+	),
+	'debug' => array(
+		'default'  => 'no',
+	),
+	'nodes' => array(
+		'default'  => '127.0.0.1:8765,127.0.0.1:8766',
+	),
+	'folder' => array(
+		'default'  => __DIR__ . '/data/node',
+		'required' => true,
+	),
+) );
+
+$port           = $arguments['port'];
+$folder         = $arguments['folder'];
+$node_addresses = array_filter( explode( ',', $arguments['nodes'] ) );
+$debug          = 'yes' === $arguments['debug'];
+
+$nodes                    = array();
+$blockchain               = new Blockchain();
+$unconfirmed_transactions = array();
+
+try {
+	$blockchain_file               = $folder . '/blockchain.json';
+	$unconfirmed_transactions_file = $folder . '/unconfirmed-transactions.json';
+
+	if ( file_exists( $blockchain_file ) ) {
+		debug( 'Loading blockchain...' );
+
+		$contents = file_get_contents( $blockchain_file );
+
+		if ( false === $contents ) {
+			throw new Exception( 'Cannot read blockchain file' );
+		}
+
+		$blockchain->fromJSON( $contents );
+	} else {
+		debug( 'Blockchain not found, generating a new one...' );
+
+		$genesis_block = $blockchain->generate_genesis_block();
+
+		$blockchain->add_block( $genesis_block );
+
+		save_blockchain();
+	}
+
+	if ( file_exists( $unconfirmed_transactions_file ) ) {
+		debug( 'Loading unconfirmed transactions...' );
+
+		$contents = file_get_contents( $unconfirmed_transactions_file );
+
+		if ( false === $contents ) {
+			throw new Exception( 'Cannot read unconfirmed transactions file' );
+		}
+
+		$encoded_transactions = ( array )@json_decode( $contents );
+
+		if ( null === $encoded_transactions ) {
+			throw new Exception( 'Invalid transactions' );
+		}
+
+		if ( ! is_array( $encoded_transactions ) ) {
+			throw new Exception( 'Invalid data' );
+		}
+
+		foreach ( $encoded_transactions as $encoded_transaction ) {
+			$transaction = new Transaction();
+
+			$transaction->fromObject( $encoded_transaction );
+
+			$unconfirmed_transactions[ $transaction->hash ] = $transaction;
+		}
+	}
+} catch ( Exception $e ) {
+	$blockchain = null;
+
+	debug( sprintf( 'Error loading blockchain: %s.', $e->getMessage() ) );
+}
+
+$status = 1;
+
+if ( null !== $blockchain ) {
+	$node_id = get_node_id();
+
+	debug( sprintf( "Identified itself as '%s'.", $node_id ) );
+
+	if ( ! empty( $node_addresses ) ) {
+		debug( 'Connecting to predefined nodes...' );
+
+		foreach ( $node_addresses as $node_address ) {
+			try {
+				$client = create_client( $node_address );
+
+				$id = $client->get( '/ping', array(
+					'from_port' => $port,
+				) );
+
+				add_node( $id, $client );
+
+				debug( sprintf( "Added node '%s'.", $id ) );
+			} catch ( Exception $e ) {
+				debug( sprintf( "Cannot connect to node '%s' (%s).", $node_address, $e->getMessage() ) );
+			}
+		}
+	}
+
+	broadcast_message( 'get_block_count', null, 'receive_block_count' );
+
+	broadcast_message( 'get_unconfirmed_transactions', null, function( $unconfirmed_transactions, $client_node_id ) {
+		debug( sprintf( 'Received %s unconfirmed transactions.', count( $unconfirmed_transactions ) ) );
+
+		foreach ( $unconfirmed_transactions as $data ) {
+			try {
+				$transaction = new Transaction();
+
+				$transaction->fromObject( $data );
+
+				add_unconfirmed_transaction( $transaction, $client_node_id );
+			} catch ( Exception $e ) {
+				debug( sprintf( 'Transaction discarded: %s.', $e->getMessage() ) );
+			}
+		}
+	} );
+
+	debug( 'Creating server...' );
+
+	$server = new HTTP_JSON_Server( $port, 'receive_message' );
+
+	attach_signals( array( SIGINT, SIGTERM ), 'signal_callback' );
+
+	debug( 'Starting server...' );
+
+	if ( ! $server->start() ) {
+		debug( sprintf( 'Cannot start node. Port %s already in use.', $port ) );
+	} else {
+		debug( 'Finished.' );
+
+		$status = 0;
+	}
+}
+
+return $status;

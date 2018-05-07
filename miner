@@ -1,0 +1,211 @@
+#!/usr/bin/php
+<?php
+declare( ticks = 1 );
+
+define( 'CHECK_INTERVAL', 60 );
+
+require_once __DIR__ . '/inc/class-address.php';
+require_once __DIR__ . '/inc/class-block.php';
+require_once __DIR__ . '/inc/class-http-json-client.php';
+require_once __DIR__ . '/inc/cli.php';
+require_once __DIR__ . '/inc/sanitization.php';
+
+function update_mining_information() {
+	global $client, $latest_block, $unconfirmed_transactions, $award_amount, $difficulty;
+
+	print_message( 'Retrieving latest block...' );
+
+	$latest_block = $client->get( '/get_latest_block' );
+
+	print_message( 'Getting unconfirmed transactions...' );
+
+	$unconfirmed_transactions = $client->get( '/get_unconfirmed_transactions' );
+
+	usort( $unconfirmed_transactions, function( $a, $b ) {
+		$compare = 0;
+
+		if ( isset( $a->timestamp ) && isset( $b->timestamp ) ) {
+			$compare = absint( $a->timestamp ) - absint( $b->timestamp );
+		}
+
+		return $compare;
+	} );
+
+	print_message( 'Getting award amount...' );
+
+	$award_amount = $client->get( '/get_award_amount' );
+
+	print_message( 'Getting desired difficulty...' );
+
+	$difficulty = $client->get( '/get_difficulty' );
+}
+
+function stop_mining() {
+	global $block, $mining;
+
+	if ( null !== $block ) {
+		$block->cancel_find_nonce();
+	}
+
+	$mining = false;
+}
+
+$arguments = parse_arguments( array(
+	'folder' => array(
+		'required' => true,
+		'default'  => __DIR__ . '/data/wallet',
+	),
+	'server' => array(
+		'required' => true,
+		'default'  => '127.0.0.1:8765',
+	),
+	'payload' => array(),
+) );
+
+$server  = $arguments['server'];
+$folder  = $arguments['folder'];
+$payload = $arguments['payload'];
+
+try {
+	$password = prompt( 'Enter miner wallet password: ', '*' );
+	$address  = new Address( $folder, $password );
+	$block    = null;
+	$mining   = true;
+
+	$last_generated_transaction = null;
+
+	if ( ! $address->exists() ) {
+		throw new Exception( 'Unexistent address' );
+	}
+
+	if ( ! $address->check_passphrase() ) {
+		throw new Exception( 'Invalid password' );
+	}
+
+	$client = new HTTP_JSON_Client( $server, array(
+		'Patacoin-Sender' => array(
+			'type' => 'miner',
+			'id'   => $address->get_id(),
+		),
+	) );
+
+	pcntl_signal( SIGINT, function() {
+		stop_mining();
+
+		print_message( 'Mining cancelled.' );
+	}, false );
+
+	pcntl_signal( SIGALRM, function() {
+		global $block, $latest_block, $difficulty, $unconfirmed_transactions;
+
+		if ( null !== $block ) {
+			try {
+				print_message( 'Checking if conditions have changed...' );
+
+				update_mining_information();
+
+				try {
+					if ( $latest_block->hash !== $block->previous_hash ) {
+						throw new Exception( 'Blockchain has changed' );
+					}
+
+					if ( $difficulty !== $block->difficulty ) {
+						throw new Exception( 'Difficulty has changed' );
+					}
+
+					$transactions_changed = false;
+
+					if ( count( $block->transactions ) - 1 !== count( $unconfirmed_transactions ) ) {
+						$transactions_changed = true;
+					} else {
+						$unconfirmed_transaction_hashes = array();
+
+						for ( $i = 1; $i < count( $block->transactions ); $i++ ) {
+							$unconfirmed_transaction_hashes[ $block->transactions[ $i ]->hash ] = true;
+						}
+
+						foreach ( $unconfirmed_transactions as $unconfirmed_transaction ) {
+							if ( ! isset( $unconfirmed_transaction_hashes[ $unconfirmed_transaction->hash ] ) ) {
+								$transactions_changed = true;
+
+								break;
+							}
+						}
+					}
+
+					if ( $transactions_changed ) {
+						throw new Exception( 'Transactions have changed' );
+					}
+
+					print_message( 'Resuming process...' );
+				} catch ( Exception $e ) {
+					$block->cancel_find_nonce();
+
+					print_message( sprintf( 'Restarting process: %s...', $e->getMessage() ) );
+				}
+			} catch ( Exception $e ) {
+				stop_mining();
+
+				print_message( sprintf( 'Disconnected from server: %s.', $e->getMessage() ) );
+			}
+		}
+		
+		pcntl_alarm( CHECK_INTERVAL );
+	}, false );
+
+	pcntl_alarm( CHECK_INTERVAL );
+
+	update_mining_information();
+
+	while ( $mining ) {
+		$award_transaction = new Transaction();
+
+		$award_transaction->receiver = $address->get_id();
+		$award_transaction->amount   = $award_amount;
+
+		if ( $last_generated_transaction === time() ) {
+			$award_transaction->payload = sprintf( 'Some randomness to avoid collisions %s...', uniqid( '', true ) );
+		}
+
+		$award_transaction->hash();
+
+		$last_generated_transaction = $award_transaction->timestamp;
+
+		$transactions = array_merge( array( $award_transaction ), $unconfirmed_transactions );
+
+		$block = new Block();
+
+		$block->difficulty    = $difficulty;
+		$block->transactions  = $transactions;
+		$block->payload       = $payload;
+		$block->previous_hash = $latest_block->hash;
+
+		$block->sign( $address );
+
+		print_message( 'Starting to mine...' );
+
+		if ( $block->find_nonce() ) {
+			$response = $client->post( '/mine', $block );
+
+			if ( $response ) {
+				$message = 'Hooray! Block accepted.';
+			} else {
+				$message = 'Block rejected.';
+			}
+
+			print_message( $message );
+
+			update_mining_information();
+		}
+
+		$block = null;
+	}
+
+	$status = 0;
+} catch ( Exception $e ) {
+	print_error( $e->getMessage() );
+
+	$status = 1;
+}
+
+return $status;

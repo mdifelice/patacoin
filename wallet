@@ -1,0 +1,227 @@
+#!/usr/bin/php
+<?php
+require_once __DIR__ . '/inc/class-address.php';
+require_once __DIR__ . '/inc/class-http-json-client.php';
+require_once __DIR__ . '/inc/class-transaction.php';
+require_once __DIR__ . '/inc/cli.php';
+require_once __DIR__ . '/inc/sanitization.php';
+require_once __DIR__ . '/inc/security.php';
+
+function update_balance( $confirmed_balance ) {
+	global $balance, $client, $address_id;
+
+	$unconfirmed_transactions = $client->get( '/get_unconfirmed_transactions' );
+	$unconfirmed_balance      = 0;
+	$balance                  = $confirmed_balance;
+
+	foreach ( $unconfirmed_transactions as $unconfirmed_transaction ) {
+		if ( $address_id === $unconfirmed_transaction->sender ) {
+			$unconfirmed_balance -= $unconfirmed_transaction->amount;
+		} elseif ( $address_id === $unconfirmed_transaction->receiver ) {
+			$unconfirmed_balance += $unconfirmed_transaction->amount;
+		}
+	}
+
+	$balance += $unconfirmed_balance;
+
+	print_message( sprintf( "Available funds: %s%s.", $balance, $unconfirmed_balance ? sprintf( ' (unconfirmed %s)', $unconfirmed_balance ) : '' ) );
+}
+
+$arguments = parse_arguments( array(
+	'folder' => array(
+		'required' => true,
+		'default'  => __DIR__ . '/data/wallet',
+	),
+	'server' => array(
+		'required' => true,
+		'default'  => '127.0.0.1:8765',
+	),
+) );
+
+$server = $arguments['server'];
+$folder = $arguments['folder'];
+
+$password = prompt( 'Enter your wallet password: ', '*' );
+
+try {
+	$address = new Address( $folder, $password );
+	$balance = 0;
+
+	if ( $address->exists() ) {
+		$mask = "Loaded wallet with address:\n%s";
+	} else {
+		while ( ( $confirm_password = prompt( isset( $confirm_password ) ? 'Passwords do not match, enter it again: ' : 'Please confirm your password: ', '*' ) ) !== $password );
+
+		$address->generate_keys();
+
+		$mask = "Created new wallet with address:\n%s";
+	}
+
+	if ( ! $address->check_passphrase() ) {
+		throw new Exception( 'Invalid password' );
+	}
+
+	$address_id = $address->get_id();
+
+	print_message( sprintf( $mask, $address_id ) );
+
+	$read = true;
+
+	$client = new HTTP_JSON_Client( $server, array(
+		'Patacoin-Sender' => array(
+			'type' => 'wallet',
+			'id'   => $address_id,
+		),
+	) );
+
+	while ( $read ) {
+		$input = prompt( '> ' );
+
+		$arguments = array_filter( explode( ' ', $input ), function( $value ) {
+			return '' !== $value;
+		} );
+		$command   = array_shift( $arguments );
+
+		if ( ! empty( $command ) ) {
+			$message        = null;
+			$data           = null;
+			$callback       = null;
+			$error_callback = null;
+			$method         = 'GET';
+
+			try {
+				switch ( $command ) {
+					case 'get_address':
+						print_message( sprintf( "Wallet Address:\n%s", $address_id ) );
+						break;
+					case 'exit':
+						$read = false;
+						break;
+					case 'send':
+						if ( count( $arguments ) < 2 ) {
+							 throw new Exception( 'Usage: send <amount> <receiver> <message>, <message> is optional' );
+						}
+
+						$amount   = absint( array_shift( $arguments ) );
+						$receiver = array_shift( $arguments );
+
+						if ( ! $amount ) {
+							throw new Exception( 'Invalid amount' );
+						}
+
+						if ( $amount > $balance ) {
+							throw new Exception( 'Not enough funds' );
+						}
+
+						if ( ! is_valid_address( $receiver ) ) {
+							throw new Exception( 'Invalid receiver' );
+						}
+
+						if ( $receiver === $address_id ) {
+							throw new Exception( 'Cannot send funds to itself' );
+						}
+
+						$transaction = new Transaction();
+
+						$transaction->receiver = $receiver;
+						$transaction->amount   = $amount;
+						$transaction->payload  = ! empty( $arguments ) ? implode( ' ', $arguments ) : null;
+						$transaction->sign( $address );
+						$transaction->hash();
+
+						$method   = 'POST';
+						$message  = 'create_transaction';
+						$data     = $transaction;
+						$callback = function( $response ) use( $transaction ) {
+							global $balance;
+
+							$balance -= $transaction->amount;
+
+							print_message( 'Transaction sent to node.' );
+						};
+						break;
+					case 'update':
+						$message        = 'get_balance';
+						$data           = array(
+							'address' => $address_id
+						);
+
+						$error_callback = function() {
+							update_balance( 0 );
+						};
+
+						$callback       = function( $balance ) {
+							update_balance( $balance );
+						};
+						break;
+					case 'get_block_count':
+						$message = 'get_block_count';
+						break;
+					case 'get_block':
+						if ( count( $arguments ) < 1 ) {
+							throw new Exception( 'Usage: get_block <block_id>' );
+						}
+
+						$message  = 'get_block';
+						$block_id = array_shift( $arguments );
+
+						if ( ctype_digit( $block_id ) ) {
+							$data = array(
+								'index' => $block_id,
+							);
+						} else {
+							$data = array(
+								'hash' => $block_id,
+							);
+						}
+						break;
+					case 'get_transaction':
+						if ( count( $arguments ) < 1 ) {
+							throw new Exception( 'Usage: get_transaction <transaction_id>' );
+						}
+
+						$message = 'get_transaction';
+						$data    = array(
+							'hash' => array_shift( $arguments ),
+						);
+						break;
+					default:
+						throw new Exception( sprintf( "Unknown command '%s'", $command ) );
+						break;
+				}
+
+				if ( $message ) {
+					print_message( 'Calling API...' );
+
+					$path = sprintf( '/%s', $message );
+
+					try {
+						$response = $client->call( $method, $path, $data );
+
+						if ( $callback ) {
+							call_user_func( $callback, $response );
+						} else {
+							print_message( sprintf( "JSON Response:\n%s", json_encode( $response, JSON_PRETTY_PRINT ) ) );
+						}
+					} catch ( Exception $e ) {
+						if ( $error_callback ) {
+							call_user_func( $error_callback );
+						} else {
+							throw $e;
+						}
+					}
+				}
+			} catch ( Exception $e ) {
+				print_error( $e->getMessage() );
+			}
+		}
+	}
+
+	$status = 0;
+} catch ( Exception $e ) {
+	print_error( $e->getMessage() );
+
+	$status = 1;
+}
+
+return $status;
